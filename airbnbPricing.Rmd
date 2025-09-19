@@ -1,0 +1,1745 @@
+---
+title: "AIRbnbPricing"
+author: "Dillon"
+date: "2025-08-28"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+# Hierarchical Bayesian Airbnb Pricing Model using brms
+# Theory-driven approach with location nested within cities
+
+library(brms)
+library(tidyverse)
+library(ggplot2)
+library(bayesplot)
+library(here)
+library(rio)
+
+library(sf)
+library(geosphere)
+library(mgcv)
+library(lubridate)
+```
+
+
+```{r}
+# ============================================================================
+# 1. DATA PREPARATION
+# ============================================================================
+
+
+NYClisting <- import(here("Data","NYClistings.csv"))
+NYCpricing <- import(here("Data","NYCpricing.csv"))
+CHIlisting <- import(here("Data","CHIlistings.csv"))
+CHIpricing <- import(here("Data","CHIpricing.csv"))
+MIAlisting <- import(here("Data","MIAlistings.csv"))
+MIApricing <- import(here("Data","MIApricing.csv"))
+LAlisting  <- import(here("Data","LAlistings.csv"))
+LApricing  <- import(here("Data","LApricing.csv"))
+HOUlisting  <- import(here("Data","HOUlistings.csv"))
+HOUpricing  <- import(here("Data","HOUpricing.csv"))
+
+NYC <- left_join(NYCpricing, NYClisting, by = "listing_id")
+CHI <- left_join(CHIpricing, CHIlisting, by = "listing_id")
+MIA <- left_join(MIApricing, MIAlisting, by = "listing_id")
+LA <- left_join(LApricing, LAlisting, by = "listing_id")
+HOU <- left_join(HOUpricing, HOUlisting, by = "listing_id")
+
+NYC <- NYC %>% mutate(city = "NYC")
+CHI <- CHI %>% mutate(city = "CHI")
+MIA <- MIA %>% mutate(city = "MIA")
+LA <- LA  %>% mutate(city = "LA")
+HOU <- HOU  %>% mutate(city = "HOU")
+
+fullListing <- rbind(NYC,CHI,MIA,LA, HOU)
+
+rm(NYClisting, NYCpricing, NYC, CHIlisting, CHIpricing, CHI, MIAlisting, MIApricing, MIA, LAlisting, LApricing, LA, HOUlisting, HOUpricing, HOU)
+
+fullListing <- fullListing %>% filter(!is.na(guests)&!is.na(beds)&!is.na(bedrooms)&!is.na(baths))
+fullListing <- fullListing %>% mutate(booking_date= date)
+
+df <- fullListing
+df <- df %>% mutate(
+price = booked_rate_avg,
+property_id = listing_id,
+occupancy=reserved_days/(reserved_days+vacant_days),
+Minimum_nights=min_nights,
+reviews=num_reviews,
+revenue=native_revenue
+)
+
+df <- df %>% filter(price<1000) #luxury listings cluster away from normal and skew models
+
+
+rm(fullListing)
+```
+
+```{r}
+# Hierarchical Bayesian Airbnb Pricing Model using brms
+# Theory-driven approach with location nested within cities
+
+# ============================================================================
+# 1. DATA PREPARATION WITH SPATIAL AND TEMPORAL COMPONENTS
+# ============================================================================
+
+
+# Data preparation with spatial and temporal features
+prep_data <- function(df) {
+  
+  # First, handle date parsing and temporal features
+  df_temporal <- df %>%
+    mutate(
+      # Parse the date (assuming booking_date is character in YYYY-MM-DD format)
+      booking_date = as.Date(booking_date),
+      
+      # Extract temporal features
+      year = year(booking_date),
+      month = month(booking_date),
+      month_name = month(booking_date, label = TRUE, abbr = FALSE),
+      day_of_year = yday(booking_date),
+      week_of_year = week(booking_date),
+      
+      # Day of week features
+      weekday = wday(booking_date, label = TRUE, abbr = FALSE),
+      is_weekend = weekday %in% c("Saturday", "Sunday"),
+      
+      # Holiday and peak season indicators
+      is_summer_peak = month %in% 6:8,  # June-August
+      is_winter_holiday = month %in% c(12, 1),  # Dec-Jan
+      is_spring_break = month == 3,  # March
+      
+      # Create factors with proper ordering
+      city = as.factor(city),
+      month = factor(month, levels = 1:12, labels = month.abb),
+      weekday = factor(weekday, levels = c("Monday", "Tuesday", "Wednesday", 
+                                          "Thursday", "Friday", "Saturday", "Sunday")),
+      
+      # Log-transform price for better model fit
+      log_price = log(price),
+      
+      
+      # Seasonal indicators (meteorological seasons)
+      season = case_when(
+        month(booking_date) %in% c(12, 1, 2) ~ "Winter",
+        month(booking_date) %in% c(3, 4, 5) ~ "Spring", 
+        month(booking_date) %in% c(6, 7, 8) ~ "Summer",
+        month(booking_date) %in% c(9, 10, 11) ~ "Fall"
+      ),
+      season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+      
+      # Quarterly indicators for business analysis
+      quarter = paste0("Q", quarter(booking_date)),
+      quarter = factor(quarter, levels = c("Q1", "Q2", "Q3", "Q4")),
+      
+      # Days until/since important dates
+      days_to_new_year = as.numeric(ceiling_date(booking_date, "year") - booking_date),
+      days_from_new_year = as.numeric(booking_date - floor_date(booking_date, "year")),
+      
+      # Standardize continuous predictors
+      beds_std = scale(beds)[,1],
+      baths_std = scale(baths)[,1]
+    )
+  
+  # Add spatial features by city
+  df_spatial <- df_temporal %>%
+    group_by(city) %>%
+    mutate(
+      # Center coordinates within each city (for better spatial modeling)
+      lat_centered = scale(latitude, center = TRUE, scale = FALSE)[,1],
+      lon_centered = scale(longitude, center = TRUE, scale = FALSE)[,1],
+      
+      # Distance from city center (assuming center is mean lat/lon)
+      dist_from_center = sqrt(lat_centered^2 + lon_centered^2),
+      dist_from_center_std = scale(dist_from_center)[,1]
+    ) %>%
+    ungroup()
+  
+  # Create spatial clusters/neighborhoods using k-means within each city
+  df_final <- df_spatial %>%
+    group_by(city) %>%
+    do({
+      if(nrow(.) > 10) {  # Only cluster if enough points
+        coords <- select(., latitude, longitude)
+        # Choose number of clusters based on city size
+        n_clusters <- min(max(floor(nrow(.)/50), 3), 9)  # 3-9 clusters
+        clusters <- kmeans(coords, centers = n_clusters, nstart = 20)
+        mutate(., spatial_cluster = paste0(first(city), "_cluster_", clusters$cluster))
+      } else {
+        mutate(., spatial_cluster = paste0(first(city), "_cluster_1"))
+      }
+    }) %>%
+    ungroup() %>%
+    mutate(
+      spatial_cluster = as.factor(spatial_cluster),
+      # Create unique ID for spatial random effects
+      spatial_id = row_number(),
+      
+      # Create time-space interaction terms
+      month_city = paste0(month, "_", city),
+      season_city = paste0(season, "_", city),
+      weekend_city = paste0(is_weekend, "_", city)
+    )
+  
+  return(df_final)
+}
+
+# Function to add advanced temporal features
+add_advanced_temporal_features <- function(df) {
+  
+  df %>%
+    arrange(booking_date) %>%
+    mutate(
+      # Lag features (previous periods)
+      lag_1_month = lag(month, 30),  # Approximate monthly lag
+      lag_1_week = lag(weekday, 7),   # Weekly lag
+      
+      # Rolling averages (if you have multiple years of data)
+      booking_date_numeric = as.numeric(booking_date),
+      
+      # Cyclical encoding for better model performance
+      month_sin = sin(2 * pi * month(booking_date) / 12),
+      month_cos = cos(2 * pi * month(booking_date) / 12),
+      day_of_year_sin = sin(2 * pi * day_of_year / 365.25),
+      day_of_year_cos = cos(2 * pi * day_of_year / 365.25),
+      
+      # Special event indicators
+      is_holiday_period = month %in% c("Nov", "Dec", "Jan") | 
+                         (month == "Jul" & day(booking_date) <= 7) |  # July 4th period
+                         (month == "May" & day(booking_date) >= 25),   # Memorial Day
+      
+    )
+}
+
+
+# ============================================================================
+# PRIORS SPECIFICATION
+# ============================================================================
+# Priors for basic spatial-temporal model (corrected based on get_prior output)
+priors_basic <- c(
+  # Overall intercept 
+  prior(normal(4.5, 0.5), class = Intercept),
+  
+  # Bed/bath effects 
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  
+  # Distance from center effect 
+  prior(normal(-0.1, 0.05), class = b, coef = dist_from_center_std),
+  
+  # Weekend effect 
+  prior(normal(0.05, 0.05), class = b, coef = is_weekendTRUE),
+  
+  # Month effects (using actual parameter names from get_prior)
+  prior(normal(0, 0.15), class = b, coef = monthFeb),
+  prior(normal(0, 0.15), class = b, coef = monthMar),
+  prior(normal(0, 0.15), class = b, coef = monthApr),
+  prior(normal(0, 0.15), class = b, coef = monthMay),
+  prior(normal(0.05, 0.15), class = b, coef = monthJun),
+  prior(normal(0.1, 0.15), class = b, coef = monthJul),
+  prior(normal(0.1, 0.15), class = b, coef = monthAug),
+  prior(normal(0, 0.15), class = b, coef = monthSep),
+  prior(normal(0, 0.15), class = b, coef = monthOct),
+  prior(normal(0, 0.15), class = b, coef = monthNov),
+  prior(normal(-0.05, 0.15), class = b, coef = monthDec),
+  
+  # Weekday effects (using contrast coding names from get_prior)
+  prior(normal(0, 0.1), class = b, coef = weekday.L),
+  prior(normal(0, 0.1), class = b, coef = weekday.Q),
+  prior(normal(0, 0.1), class = b, coef = weekday.C),
+  prior(normal(0, 0.1), class = b, coef = weekdayE4),
+  prior(normal(0, 0.1), class = b, coef = weekdayE5),
+  
+  # Random effect standard deviations
+  prior(exponential(2), class = sd, group = city),
+  prior(exponential(3), class = sd, group = "city:spatial_cluster"),
+  prior(exponential(2), class = sd, group = month),
+  
+  # Overall residual variance
+  prior(exponential(1), class = sigma)
+)
+
+# Set informative priors for more complex spatial models
+priors_peak_periods <- c(
+  # Overall intercept 
+  prior(normal(4.5, 0.5), class = Intercept),
+  
+  # Property characteristics
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  
+  # Spatial effects
+  prior(normal(-0.1, 0.05), class = b, coef = dist_from_center_std),
+  
+  # Seasonal effects
+  prior(normal(0, 0.2), class = b, coef = seasonSpring),
+  prior(normal(0.1, 0.2), class = b, coef = seasonSummer),
+  prior(normal(0, 0.2), class = b, coef = seasonFall),
+  
+  # Weekday effects (contrast coding)
+  
+  # Peak period main effects
+  prior(normal(0.15, 0.1), class = b, coef = is_summer_peakTRUE),
+  prior(normal(0.1, 0.1), class = b, coef = is_winter_holidayTRUE),
+  prior(normal(0.05, 0.1), class = b, coef = is_spring_breakTRUE),
+  prior(normal(0.1, 0.1), class = b, coef = is_holiday_periodTRUE),
+  
+  # City-specific holiday interactions
+  prior(normal(0, 0.1), class = b, coef = "is_holiday_periodTRUE:cityLA"),
+  prior(normal(0, 0.1), class = b, coef = "is_holiday_periodTRUE:cityMIA"),
+  prior(normal(0, 0.1), class = b, coef = "is_holiday_periodTRUE:cityNYC"),
+  
+  # City-specific summer peak interactions  
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakTRUE:cityLA"),
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakTRUE:cityMIA"),
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakTRUE:cityNYC"),
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakFALSE:cityLA"),
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakFALSE:cityMIA"),
+  prior(normal(0, 0.1), class = b, coef = "is_summer_peakFALSE:cityNYC"),
+  
+  # Random effect standard deviations
+  prior(exponential(2), class = sd),
+  
+  # Overall residual variance
+  prior(exponential(1), class = sigma)
+)
+
+# Priors specifically for peak periods model (based on actual get_prior output)
+priors_peak_periods2 <- c(
+  # Overall intercept 
+  prior(normal(4.5, 0.5), class = Intercept),
+  
+  # Property characteristics
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  
+  # Spatial effects
+  prior(normal(-0.1, 0.1), class = b, coef = dist_from_center_std),
+  
+  # Seasonal effects
+  prior(normal(0, 0.2), class = b, coef = seasonSpring),
+  prior(normal(0, 0.2), class = b, coef = seasonSummer),
+  prior(normal(0, 0.2), class = b, coef = seasonFall),
+  
+  # Review effects
+  #prior(normal(0, 0.2), class = b, coef = rating_overall),
+  
+  # Random effect standard deviations
+  prior(exponential(2), class = sd),
+  
+  # Overall residual variance
+  prior(exponential(1), class = sigma)
+)
+
+priors_peak_periods3 <- c(
+  # Overall intercept 
+  prior(normal(4.5, 0.5), class = Intercept),
+  
+  # Property characteristics
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  prior(normal(0, 0.1), class = b, coef = listing_type),
+  
+  # Spatial effects
+  
+  # Seasonal effects
+  prior(normal(0, 0.2), class = b, coef = seasonSpring),
+  prior(normal(0, 0.2), class = b, coef = seasonSummer),
+  prior(normal(0, 0.2), class = b, coef = seasonFall),
+  
+  # Review effects
+  #prior(normal(0, 0.2), class = b, coef = rating_overall),
+  
+  # Random effect standard deviations
+  prior(exponential(2), class = sd),
+  
+  # Overall residual variance
+  prior(exponential(1), class = sigma)
+)
+
+# Minimal priors for streamlined model
+priors_streamlined <- c(
+  # Intercept
+  prior(normal(4.5, 0.5), class = Intercept),
+  
+  # Main effects
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  prior(normal(0.05, 0.05), class = b, coef = is_weekendTRUE),
+  prior(normal(-0.1, 0.05), class = b, coef = dist_from_center_std),
+  
+  # Seasonal effects
+  prior(normal(0, 0.2), class = b, coef = seasonSpring),
+  prior(normal(0.1, 0.2), class = b, coef = seasonSummer),
+  prior(normal(0, 0.2), class = b, coef = seasonFall),
+  
+  # Random effect standard deviations
+  prior(exponential(2), class = sd),
+  
+  # Residual variance
+  prior(exponential(1), class = sigma)
+)
+
+
+
+
+# Create appropriate priors for the cyclical model
+priors_cyclical <- c(
+  # Intercept and main effects
+  prior(normal(4.5, 0.5), class = Intercept),
+  prior(normal(0.2, 0.1), class = b, coef = beds_std),
+  prior(normal(0.15, 0.1), class = b, coef = baths_std),
+  prior(normal(0.1, 0.05), class = b, coef = beds_baths),
+  prior(normal(0.05, 0.05), class = b, coef = is_weekendTRUE),
+  
+  # Random effects
+  prior(exponential(2), class = sd),
+  
+  # Smooth function parameters
+  prior(normal(0, 1), class = sds),  # For all smooth terms
+  
+  # Residual variance
+  prior(exponential(1), class = sigma)
+)
+
+
+df_ready <- df %>%
+  filter(occupancy>0.1) %>% 
+  prep_data() %>%
+  add_advanced_temporal_features()
+
+  # Fix the obvious location errors
+df_ready <- df_ready %>%
+  mutate(
+    # Fix positive longitudes (should be negative in US)
+    longitude = ifelse(longitude > 0, -longitude, longitude),
+    
+    # Fix any extreme outliers (potential data entry errors)
+    latitude = case_when(
+      latitude < 20 ~ NA_real_,          # Too far south
+      latitude > 50 ~ NA_real_,          # Too far north  
+      TRUE ~ latitude
+    ),
+    longitude = case_when(
+      longitude > -50 ~ NA_real_,        # Too far east (after sign fix)
+      longitude < -130 ~ NA_real_,       # Too far west
+      TRUE ~ longitude
+    )
+  ) %>%
+  # Remove rows with invalid coordinates
+  filter(!is.na(latitude) & !is.na(longitude))
+
+names(df_ready)
+summary(df_ready)
+```
+
+
+```{r}
+simple_working_model <- brm(
+  log_price ~ beds_std + baths_std + 
+              (1 | city) + (1 | spatial_cluster),
+  data = df_ready,
+  family = gaussian(),
+  chains = 4,        # Fewer chains
+  iter = 2000,      
+  warmup = 1000,
+  cores = 4,
+  file = here("Models/simple_working")
+)
+
+model_streamlined <- brm(
+  log_price ~ 
+    beds_std + baths_std + 
+    season + is_weekend +
+    (1 | season:city) + 
+    (1 | spatial_cluster),
+  data = df_ready,
+  prior= priors_streamlined,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  cores = 4,
+  file = here("Models/streamlined")
+)
+
+# Model summary
+summary(model_streamlined)
+
+
+model_complex3 <- brm(
+  formula = log_price ~ 
+    #Could use overall rating, location rating could be used in spatial effects
+    beds_std + baths_std + listing_type+# Property characteristics
+    season + is_weekend +    # Temporal main effects
+    (1 | spatial_cluster) + #  Hierarchical structure
+    (1 | month:city),
+  data = df_ready,
+  prior = priors_peak_periods3,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup=1000,
+  cores = 4,
+  file = here("Models/complex3")
+)
+
+model_complex4 <- brm(
+  formula = log_price ~ 
+    #Could use overall rating, location rating could be used in spatial effects
+    beds_std + baths_std + listing_type + # Property characteristics
+    season +    # Temporal main effects
+    (1 | spatial_cluster) + #  Hierarchical structure
+    (1 | season:city),
+  data = df_ready,
+  prior = priors_peak_periods3,
+  family = gaussian(),
+  chains = 4,
+  iter = 3000,
+  warmup=1000,
+  cores = 4,
+  control = list(adapt_delta = 0.95),
+  file = here("Models/complex4")
+)
+
+
+
+
+# Compare using LOO cross-validation
+loo1 <- loo(model_basic)
+loo2 <- loo(model_complex)
+loo3 <- loo(simple_working_model)
+loo4 <- loo(model_streamlined)
+loo5 <- loo(model_complex2)
+
+loo6 <- loo(model_complex3)
+loo7 <- loo(model_complex4)
+
+# Compare models
+loo_compare(loo1, loo4, loo2, loo3, loo5)
+loo_compare(loo6, loo7)
+
+# ============================================================================
+# 6. PRICING PREDICTIONS AND OPTIMIZATION
+# ============================================================================
+
+predict_optimal_price <- function(model, new_data) {
+  
+  # Generate posterior predictions
+  pred_samples <- posterior_predict(model, newdata = new_data)
+  
+  # Convert from log scale back to price scale
+  pred_prices <- exp(pred_samples)
+  
+  # Calculate credible intervals
+  price_summary <- new_data %>%
+    mutate(
+      pred_mean = apply(pred_prices, 2, mean),
+      pred_median = apply(pred_prices, 2, median),
+      pred_lower = apply(pred_prices, 2, quantile, 0.025),
+      pred_upper = apply(pred_prices, 2, quantile, 0.975),
+      pred_sd = apply(pred_prices, 2, sd)
+    )
+  
+  return(price_summary)
+}
+
+# Revenue optimization function
+
+
+# ============================================================================
+# 7. SPATIAL VISUALIZATION AND INTERPRETATION
+# ============================================================================
+
+# Plot spatial effects within cities
+plot_spatial_effects <- function(model, data) {
+  
+  if("mgcv" %in% class(model$fit)) {
+    # For GAM models, plot smooth effects
+    plot(model, ask = FALSE)
+  }
+  
+  # Extract and plot spatial cluster effects
+  if("spatial_cluster" %in% names(ranef(model))) {
+    
+    cluster_effects <- ranef(model)$spatial_cluster[, , "Intercept"] %>%
+      as_tibble(rownames = "spatial_cluster") %>%
+      separate(spatial_cluster, into = c("city", "cluster_info"), sep = "_cluster_") %>%
+      mutate(cluster_num = as.numeric(cluster_info))
+    
+    p1 <- ggplot(cluster_effects, aes(x = cluster_num, y = Estimate, color = city)) +
+      geom_point() +
+      geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+      facet_wrap(~city, scales = "free_x") +
+      labs(title = "Spatial Cluster Effects by City",
+           x = "Cluster Number", y = "Log Price Effect") +
+      theme_minimal()
+    
+    return(p1)
+  }
+}
+
+plot_spatial_effects(model_complex, df_ready)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(metR)  # For contour functions
+
+create_price_topography_with_clusters <- function(model, data, city_name, grid_size = 50) {
+  
+  # Get city data
+  city_data <- data %>% filter(city == city_name)
+  
+  # Create prediction grid
+  lat_range <- range(city_data$latitude)
+  lon_range <- range(city_data$longitude)
+  
+  pred_grid <- expand.grid(
+    latitude = seq(lat_range[1], lat_range[2], length.out = grid_size),
+    longitude = seq(lon_range[1], lon_range[2], length.out = grid_size)
+  )
+  
+  # Function to find nearest spatial cluster
+  assign_nearest_cluster <- function(new_lat, new_lon, city_data) {
+    # Calculate Euclidean distances to all existing properties
+    distances <- sqrt((city_data$latitude - new_lat)^2 + (city_data$longitude - new_lon)^2)
+    # Find the property with minimum distance
+    nearest_idx <- which.min(distances)
+    # Return its spatial cluster
+    return(as.character(city_data$spatial_cluster[nearest_idx]))
+  }
+  
+  # Assign spatial clusters based on nearest neighbor
+  pred_grid <- pred_grid %>%
+    rowwise() %>%
+    mutate(
+      spatial_cluster = assign_nearest_cluster(latitude, longitude, city_data)
+    ) %>%
+    ungroup()
+  
+  # Add other required variables using city averages
+  city_means <- city_data %>%
+    summarise(
+      beds_std = mean(beds_std, na.rm = TRUE),
+      baths_std = mean(baths_std, na.rm = TRUE),
+      dist_from_center_std = mean(dist_from_center_std, na.rm = TRUE)
+    )
+  
+  pred_grid <- pred_grid %>%
+    mutate(
+      city = city_name,
+      beds_std = city_means$beds_std,
+      baths_std = city_means$baths_std,
+      season = "Summer",
+      is_weekend = FALSE,
+      is_summer_peak = TRUE,
+      is_winter_holiday = FALSE,
+      is_spring_break = FALSE,
+      is_holiday_period = FALSE,
+      dist_from_center_std = city_means$dist_from_center_std
+    )
+  
+  # Ensure spatial_cluster is a factor with the same levels as training data
+  pred_grid$spatial_cluster <- factor(pred_grid$spatial_cluster, 
+                                     levels = levels(city_data$spatial_cluster))
+  
+  # Make predictions
+  preds <- predict(model, newdata = pred_grid, allow_new_levels = TRUE)
+  pred_grid$predicted_price <- exp(preds[,1])
+  
+  # Create topographical map
+  topo_plot <- ggplot(pred_grid, aes(x = longitude, y = latitude)) +
+    # Filled contours (price zones)
+    geom_contour_filled(aes(z = predicted_price), bins = 15, alpha = 0.8) +
+    # Contour lines
+    geom_contour(aes(z = predicted_price), color = "white", size = 0.3, bins = 25) +
+    # Label some contours
+    geom_text_contour(aes(z = predicted_price), stroke = 0.2, size = 2.5, 
+                      skip = 1, check_overlap = TRUE) +
+    # Add actual property points
+    geom_point(data = city_data, aes(x = longitude, y = latitude), 
+               color = "black", size = 0.8, alpha = 0.7) +
+    scale_fill_viridis_d(name = "Price\nZone ($)", option = "plasma") +
+    labs(title = paste("Price Topography -", city_name),
+         subtitle = "Contour lines connect areas of equal predicted price",
+         x = "Longitude", y = "Latitude") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text = element_text(size = 8),
+      legend.position = "right"
+    ) +
+    coord_fixed()
+  
+  return(topo_plot)
+}
+
+# Create topographical maps for each city
+cities <- unique(df_ready$city)
+
+for(city in cities) {
+topo_map <- create_price_topography_with_clusters(model_complex4, df_ready, city)
+print(topo_map)
+  
+  # Save if desired
+  # ggsave(paste0("price_topography_", gsub(" ", "_", city), ".png"), 
+  #        topo_map, width = 10, height = 8, dpi = 300)
+}
+
+```
+
+```{r}
+library(ggplot2)
+library(metR)  # For contour functions
+
+create_xgb_topography <- function(xgb_model, data, city_name, grid_size = 50) {
+  
+  # Get city data
+  city_data <- data %>% filter(city == city_name)
+  
+  # Create prediction grid
+  lat_range <- range(city_data$latitude)
+  lon_range <- range(city_data$longitude)
+  
+  pred_grid <- expand.grid(
+    latitude = seq(lat_range[1], lat_range[2], length.out = grid_size),
+    longitude = seq(lon_range[1], lon_range[2], length.out = grid_size)
+  )
+  
+  # Function to find nearest spatial cluster
+  assign_nearest_cluster <- function(new_lat, new_lon, city_data) {
+    # Calculate Euclidean distances to all existing properties
+    distances <- sqrt((city_data$latitude - new_lat)^2 + (city_data$longitude - new_lon)^2)
+    # Find the property with minimum distance
+    nearest_idx <- which.min(distances)
+    # Return its spatial cluster
+    return(city_data$spatial_cluster[nearest_idx])
+  }
+  
+  # Assign spatial clusters based on nearest neighbor
+  pred_grid <- pred_grid %>%
+    rowwise() %>%
+    mutate(
+      spatial_cluster = assign_nearest_cluster(latitude, longitude, city_data)
+    ) %>%
+    ungroup()
+  
+  # Add other required variables using city averages
+  city_means <- city_data %>%
+    summarise(
+      beds_std = mean(beds_std, na.rm = TRUE),
+      baths_std = mean(baths_std, na.rm = TRUE)
+    )
+  
+  pred_grid <- pred_grid %>%
+    mutate(
+      city = city_name,
+      beds_std = city_means$beds_std,
+      baths_std = city_means$baths_std,
+      listing_type = "Entire home/apt", # Most common type
+      season = "Summer"
+    )
+  
+  # Prepare features for XGBoost prediction
+  pred_features <- prepare_xgb_data(pred_grid)
+  
+  # Use the SAME feature columns that were used during training
+  feature_cols <- c(
+    "beds_std", "baths_std", 
+    "listing_type_entire", "listing_type_private", "listing_type_shared",
+    "season_spring", "season_summer", "season_fall",
+    "spatial_cluster_num",
+    # Season:city interactions
+    "spring_CHI", "spring_LA", "spring_MIA", "spring_NYC",
+    "summer_CHI", "summer_LA", "summer_MIA", "summer_NYC", 
+    "fall_CHI", "fall_LA", "fall_MIA", "fall_NYC"
+  )
+  
+  # Select only the features used in training and ensure same order
+  pred_matrix <- as.matrix(pred_features[, feature_cols])
+  
+  # Make XGBoost predictions
+  pred_log_price <- predict(xgb_model, pred_matrix)
+  pred_grid$predicted_price <- exp(pred_log_price)
+  
+  # Create topographical map
+  topo_plot <- ggplot(pred_grid, aes(x = longitude, y = latitude)) +
+    # Filled contours (price zones)
+    geom_contour_filled(aes(z = predicted_price), bins = 15, alpha = 0.8) +
+    # Contour lines
+    geom_contour(aes(z = predicted_price), color = "white", size = 0.3, bins = 25) +
+    # Label some contours
+    geom_text_contour(aes(z = predicted_price), stroke = 0.2, size = 2.5, 
+                      skip = 1, check_overlap = TRUE) +
+    # Add actual property points
+    geom_point(data = city_data, aes(x = longitude, y = latitude), 
+               color = "black", size = 0.8, alpha = 0.7) +
+    scale_fill_viridis_d(name = "Price Zone ($)", option = "plasma") +
+    labs(title = paste("XGBoost Price Topography -", city_name),
+         x = "Longitude", y = "Latitude") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text = element_text(size = 8),
+      legend.position = "right"
+    ) +
+    coord_fixed()
+  
+  return(topo_plot)
+}
+
+# Run the topography maps
+cities <- unique(df_ready$city)
+for(city in cities) {
+  topo_map_xgb <- create_xgb_topography(xgb_model, df_ready, city)
+  print(topo_map_xgb)
+  
+  # Save if desired
+  # ggsave(paste0("xgb_price_topography_", gsub(" ", "_", city), ".png"), 
+  #        topo_map_xgb, width = 10, height = 8, dpi = 300)
+}
+```
+
+
+
+```{r}
+# Use zero-inflated Beta for occupancy
+# Transform occupancy to be strictly between 0 and 1
+df_ready <- df_ready %>%
+  mutate(
+    occupancy_beta = case_when(
+      occupancy == 1 ~ 0.999,  # Just under 1
+      TRUE ~ occupancy
+    )
+  )
+
+
+occupancy_model2 <- brm(
+  occupancy_beta ~ 
+    log_price + beds_std + baths_std + season + listing_type+
+    (1 + log_price | city:season) + 
+    (1 | spatial_cluster),
+  family = Beta(),
+  data = df_ready,
+  chains = 4,
+  warmup = 1000,
+  iter = 3000,
+  cores = 4,
+  file = here("Models/occupancy2")
+)
+
+
+optimize_with_occupancy_model <- function(occupancy_model, property_data, 
+                                        price_range = seq(50, 300, 10),
+                                        days_per_month = 30) {
+  
+  results <- tibble()
+  
+  for(price in price_range) {
+    test_data <- property_data %>%
+      mutate(log_price = log(price)) %>%
+      slice(1)
+    
+    # Predict occupancy at this price
+    occ_pred <- predict(occupancy_model, newdata = test_data)
+    predicted_occupancy <- occ_pred[1, "Estimate"]
+    
+    # Calculate revenue directly
+    monthly_revenue <- price * predicted_occupancy * days_per_month
+    
+    results <- bind_rows(results, tibble(
+      price = price,
+      pred_occupancy = predicted_occupancy,
+      monthly_revenue = monthly_revenue
+    ))
+  }
+  
+  optimal_idx <- which.max(results$monthly_revenue)
+  return(list(
+    optimal_price = results$price[optimal_idx],
+    results = results
+  ))
+}
+
+optimize_with_occupancy_model(occupancy_model2, df_ready[1,])
+```
+
+
+```{r}
+library(xgboost)
+library(dplyr)
+
+# Prepare data for XGBoost
+prepare_xgb_data <- function(data) {
+  
+  # Create dummy variables for categorical features
+  data_processed <- data %>%
+    # One-hot encode listing_type
+    mutate(
+      listing_type_entire = as.numeric(listing_type == "Entire home/apt"),
+      listing_type_private = as.numeric(listing_type == "Private room"),
+      listing_type_shared = as.numeric(listing_type == "Shared room"),
+      
+      # One-hot encode season
+      season_spring = as.numeric(season == "Spring"),
+      season_summer = as.numeric(season == "Summer"), 
+      season_fall = as.numeric(season == "Fall"),
+      
+      # Create city dummy variables
+      city_CHI = as.numeric(city == "CHI"),
+      city_LA = as.numeric(city == "LA"),
+      city_MIA = as.numeric(city == "MIA"),
+      city_NYC = as.numeric(city == "NYC"),
+      
+      # Convert spatial_cluster to numeric
+      spatial_cluster_num = as.numeric(as.factor(spatial_cluster))
+    ) %>%
+    # Create season:city interactions
+    mutate(
+      spring_CHI = season_spring * city_CHI,
+      spring_LA = season_spring * city_LA,
+      spring_MIA = season_spring * city_MIA,
+      spring_NYC = season_spring * city_NYC,
+      summer_CHI = season_summer * city_CHI,
+      summer_LA = season_summer * city_LA,
+      summer_MIA = season_summer * city_MIA,
+      summer_NYC = season_summer * city_NYC,
+      fall_CHI = season_fall * city_CHI,
+      fall_LA = season_fall * city_LA,
+      fall_MIA = season_fall * city_MIA,
+      fall_NYC = season_fall * city_NYC
+    )
+  
+  # Select features - include log_price only if it exists
+  feature_columns <- c(
+    "beds_std", "baths_std",
+    "listing_type_entire", "listing_type_private", "listing_type_shared",
+    "season_spring", "season_summer", "season_fall",
+    "city_CHI", "city_LA", "city_MIA", "city_NYC",
+    "spatial_cluster_num",
+    "spring_CHI", "spring_LA", "spring_MIA", "spring_NYC",
+    "summer_CHI", "summer_LA", "summer_MIA", "summer_NYC",
+    "fall_CHI", "fall_LA", "fall_MIA", "fall_NYC"
+  )
+  
+  # Add log_price to selection if it exists
+  if ("log_price" %in% names(data_processed)) {
+    feature_columns <- c("log_price", feature_columns)
+    data_processed <- data_processed %>%
+      select(all_of(feature_columns)) %>%
+      filter(complete.cases(.))
+  } else {
+    data_processed <- data_processed %>%
+      select(all_of(feature_columns))
+  }
+  
+  return(data_processed)
+}
+
+# Prepare the data
+df_xgb <- prepare_xgb_data(df_ready)
+
+# Check for any remaining missing values
+print(paste("Rows with complete data:", nrow(df_xgb)))
+print(paste("Original rows:", nrow(df_ready)))
+
+# Select features for XGBoost
+feature_cols <- c(
+  "beds_std", "baths_std", 
+  "listing_type_entire", "listing_type_private", "listing_type_shared",
+  "season_spring", "season_summer", "season_fall",
+  "spatial_cluster_num",
+  # Season:city interactions
+  "spring_CHI", "spring_LA", "spring_MIA", "spring_NYC",
+  "summer_CHI", "summer_LA", "summer_MIA", "summer_NYC", 
+  "fall_CHI", "fall_LA", "fall_MIA", "fall_NYC"
+)
+
+# Create train/test split
+set.seed(123)
+train_idx <- sample(nrow(df_xgb), 0.8 * nrow(df_xgb))
+
+# Extract features and target - KEEP THEM ALIGNED
+X_train <- as.matrix(df_xgb[train_idx, feature_cols])
+y_train <- df_xgb$log_price[train_idx]
+X_test <- as.matrix(df_xgb[-train_idx, feature_cols])
+y_test <- df_xgb$log_price[-train_idx]
+
+# Verify dimensions match
+print(paste("X_train dimensions:", nrow(X_train), "x", ncol(X_train)))
+print(paste("y_train length:", length(y_train)))
+print(paste("X_test dimensions:", nrow(X_test), "x", ncol(X_test)))
+print(paste("y_test length:", length(y_test)))
+
+# Check for any remaining NAs
+print(paste("NAs in X_train:", sum(is.na(X_train))))
+print(paste("NAs in y_train:", sum(is.na(y_train))))
+
+# Create DMatrix objects
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest <- xgb.DMatrix(data = X_test, label = y_test)
+
+# Train XGBoost model
+xgb_model <- xgb.train(
+  data = dtrain,
+  nrounds = 500,
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  verbose = 1,
+  early_stopping_rounds = 50,
+  watchlist = list(train = dtrain, test = dtest)
+)
+
+
+# Make predictions
+train_pred <- predict(xgb_model, dtrain)
+test_pred <- predict(xgb_model, dtest)
+
+
+# Evaluate performance
+evaluate_xgb <- function(actual, predicted, set_name) {
+  
+  # Convert back to price scale
+  actual_price <- exp(actual)
+  pred_price <- exp(predicted)
+  
+  metrics <- data.frame(
+    set = set_name,
+    log_correlation = cor(actual, predicted),
+    price_correlation = cor(actual_price, pred_price),
+    log_rmse = sqrt(mean((actual - predicted)^2)),
+    price_rmse = sqrt(mean((actual_price - pred_price)^2)),
+    mape = mean(abs(actual_price - pred_price) / actual_price * 100)
+  )
+  
+  return(metrics)
+}
+
+# Calculate metrics
+train_metrics <- evaluate_xgb(y_train, train_pred, "Train")
+test_metrics <- evaluate_xgb(y_test, test_pred, "Test")
+
+performance_comparison <- rbind(train_metrics, test_metrics)
+print("XGBoost Performance:")
+print(performance_comparison)
+
+# Feature importance
+importance_matrix <- xgb.importance(feature_names = feature_cols, model = xgb_model)
+print("Top 10 Most Important Features:")
+print(head(importance_matrix, 10))
+
+# Plot feature importance
+xgb.plot.importance(importance_matrix, top_n = 15)
+
+# Compare with Bayesian model on same test set
+bayesian_test_pred <- predict(model_complex4, newdata = df_ready[-train_idx, ])
+bayesian_metrics <- evaluate_xgb(y_test, bayesian_test_pred[,1], "Bayesian")
+
+all_metrics <- rbind(performance_comparison, bayesian_metrics)
+print("Model Comparison:")
+print(all_metrics)
+```
+
+
+```{r}
+# Check actual price-occupancy correlation in raw data
+df_ready %>%
+  ggplot(aes(x = log_price, y = occupancy)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth() +
+  facet_wrap(~city)
+
+# Check if there's variation in prices within cities
+df_ready %>%
+  group_by(city) %>%
+  summarise(price_sd = sd(price), price_range = max(price) - min(price))
+
+# Simple correlation by city
+df_ready %>%
+  group_by(city) %>%
+  summarise(price_occupancy_cor = cor(price, occupancy, use = "complete.obs"))
+```
+
+
+
+
+```{r}
+# Plot listings by coordinates for each city
+plot_city_spatial_distribution <- function(data) {
+  
+  # Create individual plots for each city
+  city_plots <- map(unique(data$city), function(city_name) {
+    
+    city_data <- data %>% filter(city == city_name)
+    
+    ggplot(city_data, aes(x = longitude, y = latitude)) +
+      geom_point(aes(color = spatial_cluster), alpha = 0.6, size = 1) +
+      labs(title = paste("Listing Distribution -", city_name),
+           subtitle = paste("n =", nrow(city_data), "properties"),
+           x = "Longitude", y = "Latitude") +
+      theme_minimal() +
+      coord_fixed() +  # Maintain aspect ratio
+      theme(legend.position = "none")  # Remove legend for cleaner view
+  })
+  
+  return(city_plots)
+}
+
+# Generate plots
+city_plots <- plot_city_spatial_distribution(df_ready)
+
+# Print each plot
+walk(city_plots, print)
+
+# Alternative: Combined view with all cities
+plot_all_cities_combined <- function(data) {
+  ggplot(data, aes(x = longitude, y = latitude)) +
+    geom_point(aes(color = spatial_cluster), alpha = 0.5, size = 0.8) +
+    facet_wrap(~city, scales = "free") +
+    labs(title = "Spatial Distribution of Listings by City",
+         x = "Longitude", y = "Latitude") +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+combined_plot <- plot_all_cities_combined(df_ready)
+```
+
+```{r}
+df_ready <- df_ready %>%
+  mutate(
+    property_type = paste0(beds, "BR_", baths, "BA")
+  )
+
+# Function to create price-occupancy plots by city and property type
+plot_price_occupancy_by_city <- function(model, data) {
+  
+  # Find top 4 property types overall
+  top_property_types <- data %>%
+    count(property_type, sort = TRUE) %>%
+    slice_head(n = 4) %>%
+    pull(property_type)
+  
+  # Filter data to top property types
+  plot_data <- data %>%
+    filter(property_type %in% top_property_types)
+  
+  # Create price range for predictions
+  city_plots <- map(unique(plot_data$city), function(city_name) {
+    
+    city_data <- plot_data %>% filter(city == city_name)
+    
+    # Get price range for this city
+    price_range <- seq(min(city_data$price), max(city_data$price), length.out = 50)
+    
+    # Create prediction data for each property type
+    pred_data <- expand_grid(
+      price = price_range,
+      property_type = top_property_types
+    ) %>%
+      # Add other required variables (use averages from city data)
+      left_join(
+        city_data %>%
+          group_by(property_type) %>%
+          summarise(
+            beds_std = mean(beds_std),
+            baths_std = mean(baths_std),
+            listing_type = "Entire home",
+            spatial_cluster = names(sort(table(spatial_cluster), decreasing = TRUE))[1],
+            .groups = "drop"
+          ),
+        by = "property_type"
+      ) %>%
+      mutate(
+        log_price = log(price),
+        city = city_name,
+        season = "Summer"  # Use consistent season for comparison
+      )
+    
+    # Get model predictions
+    predictions <- predict(model, newdata = pred_data)
+    
+    pred_data$predicted_occupancy <- predictions[,1]
+    
+    # Create the plot
+    p <- ggplot() +
+      # Add raw data points
+      geom_point(data = city_data, 
+                aes(x = price, y = occupancy_beta, color = property_type), 
+                alpha = 0.4, size = 1) +
+      # Add prediction lines
+      geom_line(data = pred_data, 
+               aes(x = price, y = predicted_occupancy, color = property_type), 
+               size = 1.2) +
+      labs(title = paste("Price vs Occupancy -", city_name),
+           subtitle = "Lines show model predictions for top 4 property types",
+           x = "Price ($)", 
+           y = "Occupancy",
+           color = "Property Type") +
+      theme_minimal() +
+      scale_color_viridis_d()
+    
+    return(p)
+  })
+  
+  names(city_plots) <- unique(plot_data$city)
+  return(city_plots)
+}
+
+# Generate the plots
+city_occupancy_plots <- plot_price_occupancy_by_city(occupancy_model2, df_ready)
+
+# Display each plot
+walk(city_occupancy_plots, print)
+
+```
+
+```{r}
+# Evaluate occupancy model performance
+evaluate_occupancy_model <- function(occupancy_model, data) {
+  
+  # Get predictions
+  predictions <- predict(occupancy_model, newdata = data)
+  
+  # Add predictions to data
+  eval_data <- data %>%
+    mutate(
+      predicted_occupancy = predictions[,1],
+      pred_lower = predictions[,3],  # Lower CI
+      pred_upper = predictions[,4],  # Upper CI
+      residual = occupancy_beta - predicted_occupancy,
+      abs_error = abs(residual),
+      squared_error = residual^2
+    )
+  
+  # Calculate performance metrics
+  overall_metrics <- eval_data %>%
+    summarise(
+      correlation = cor(predicted_occupancy, occupancy_beta),
+      rmse = sqrt(mean(squared_error)),
+      mae = mean(abs_error),
+      within_ci = mean(occupancy_beta >= pred_lower & occupancy_beta <= pred_upper),
+      .groups = "drop"
+    )
+  
+  # Performance by city
+  city_metrics <- eval_data %>%
+    group_by(city) %>%
+    summarise(
+      correlation = cor(predicted_occupancy, occupancy_beta),
+      rmse = sqrt(mean(squared_error)),
+      mae = mean(abs_error),
+      n_obs = n(),
+      .groups = "drop"
+    )
+  
+  # Performance by property type
+  property_metrics <- eval_data %>%
+    group_by(property_type) %>%
+    filter(n() >= 20) %>%  # Only property types with sufficient data
+    summarise(
+      correlation = cor(predicted_occupancy, occupancy_beta),
+      rmse = sqrt(mean(squared_error)),
+      mae = mean(abs_error),
+      n_obs = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(correlation))
+  
+  return(list(
+    data = eval_data,
+    overall = overall_metrics,
+    by_city = city_metrics,
+    by_property_type = property_metrics
+  ))
+}
+
+# Run evaluation
+occupancy_performance <- evaluate_occupancy_model(occupancy_model2, df_ready)
+
+print("Overall model performance:")
+print(occupancy_performance$overall)
+
+print("Performance by city:")
+print(occupancy_performance$by_city)
+
+print("Performance by property type (top 10):")
+print(head(occupancy_performance$by_property_type, 10))
+
+# Predicted vs Actual plot
+ggplot(occupancy_performance$data, aes(x = predicted_occupancy, y = occupancy_beta)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "lm", color = "blue") +
+  facet_wrap(~city) +
+  labs(title = "Predicted vs Actual Occupancy",
+       x = "Predicted Occupancy", y = "Actual Occupancy") +
+  theme_minimal()
+
+# Residuals plot
+ggplot(occupancy_performance$data, aes(x = predicted_occupancy, y = residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "loess") +
+  facet_wrap(~city) +
+  labs(title = "Model Residuals vs Predicted Values",
+       x = "Predicted Occupancy", y = "Residual") +
+  theme_minimal()
+```
+
+```{r}
+# Evaluate pricing model performance
+evaluate_pricing_model <- function(pricing_model, data) {
+  
+  # Get predictions (remember model predicts log_price)
+  predictions <- predict(pricing_model, newdata = data)
+  
+  # Add predictions to data
+  eval_data <- data %>%
+    mutate(
+      predicted_log_price = predictions[,1],
+      predicted_price = exp(predicted_log_price),  # Convert back to price scale
+      pred_lower = exp(predictions[,3]),
+      pred_lower_log = (predictions[,3]),
+      pred_upper = exp(predictions[,4]),
+      residual = price - predicted_price,
+      log_residual = log_price - predicted_log_price,
+      abs_error = abs(residual),
+      pct_error = abs(residual) / price * 100,
+      squared_error = residual^2
+    )
+  
+  # Calculate performance metrics
+  overall_metrics <- eval_data %>%
+    summarise(
+      correlation = cor(predicted_price, price),
+      log_correlation = cor(predicted_log_price, log_price),
+      lower_correlation = cor(pred_lower, price),
+      lower_log_correlation = cor(pred_lower_log, log_price),
+      rmse = sqrt(mean(squared_error)),
+      mae = mean(abs_error),
+      mape = mean(pct_error),  # Mean absolute percentage error
+      within_ci = mean(price >= pred_lower & price <= pred_upper),
+      .groups = "drop"
+    )
+  
+  # Performance by city
+  city_metrics <- eval_data %>%
+    group_by(city) %>%
+    summarise(
+      correlation = cor(predicted_price, price),
+      rmse = sqrt(mean(squared_error)),
+      mape = mean(pct_error),
+      n_obs = n(),
+      .groups = "drop"
+    )
+  
+  return(list(
+    data = eval_data,
+    overall = overall_metrics,
+    by_city = city_metrics
+  ))
+}
+
+# Run evaluation
+pricing_performance <- evaluate_pricing_model(model_complex3, df_ready)
+
+print("Overall pricing model performance:")
+print(pricing_performance$overall)
+
+print("Performance by city:")
+print(pricing_performance$by_city)
+
+# Predicted vs Actual plot
+ggplot(pricing_performance$data, aes(x = pred_lower, y = price)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "lm", color = "blue") +
+  facet_wrap(~city, scales = "free") +
+  labs(title = "Predicted vs Actual Price",
+       x = "Predicted Price ($)", y = "Actual Price ($)") +
+  theme_minimal()
+
+# Residuals plot
+ggplot(pricing_performance$data, aes(x = predicted_price, y = residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "loess") +
+  facet_wrap(~city) +
+  labs(title = "Price Model Residuals vs Predicted Values",
+       x = "Predicted Price ($)", y = "Residual ($)") +
+  theme_minimal()
+
+# Percentage error distribution
+ggplot(pricing_performance$data, aes(x = pct_error)) +
+  geom_histogram(bins = 30, alpha = 0.7) +
+  facet_wrap(~city) +
+  labs(title = "Distribution of Percentage Errors",
+       x = "Absolute Percentage Error (%)", y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+# First, deduplicate the data by property_id before processing amenities
+deduplicate_properties <- function(data) {
+  # Keep the most recent record for each property, or use other criteria
+  data_dedup <- data %>%
+    group_by(property_id) %>%
+    # Option 1: Keep first occurrence
+    filter(row_number() == 1) %>%
+    # Option 2: If you have a date column, keep most recent
+    # filter(booking_date == max(booking_date, na.rm = TRUE)) %>%
+    # Option 3: Keep record with highest occupancy
+    # filter(occupancy == max(occupancy, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(row_id = row_number())  # Create new row_id after deduplication
+  
+  return(data_dedup)
+}
+
+# Modified process_amenities function
+process_amenities_dedup <- function(data) {
+  # First deduplicate by property_id
+  data_dedup <- deduplicate_properties(data)
+  
+  amenities_processed <- data_dedup %>%
+    mutate(
+      row_id = row_number(),
+      # Just split by comma without complex cleaning
+      amenities_list = str_split(amenities, ",")
+    ) %>%
+    unnest(amenities_list) %>%
+    mutate(
+      amenity = str_trim(amenities_list),
+      amenity = str_to_lower(amenity),
+      has_amenity = 1
+    ) %>%
+    filter(amenity != "") %>%
+    select(row_id, property_id, amenity, has_amenity)  # Keep property_id for tracking
+  
+  return(amenities_processed)
+}
+
+# Modified create_amenity_matrix function
+create_amenity_matrix_dedup <- function(amenities_data, original_data, min_frequency = 50) {
+  # Deduplicate original data first
+  original_dedup <- deduplicate_properties(original_data)
+  
+  common_amenities <- amenities_data %>%
+    count(amenity, sort = TRUE) %>%
+    filter(n >= min_frequency) %>%
+    pull(amenity)
+  
+  print(paste("Found", length(common_amenities), "amenities after deduplication"))
+  print(paste("Using", nrow(original_dedup), "unique properties"))
+  
+  amenity_matrix <- amenities_data %>%
+    filter(amenity %in% common_amenities) %>%
+    pivot_wider(
+      names_from = amenity, 
+      values_from = has_amenity, 
+      values_fill = 0,
+      names_prefix = "amenity_"
+    ) %>%
+    right_join(original_dedup, by = "row_id") %>%
+    mutate(across(starts_with("amenity_"), ~replace_na(.x, 0)))
+  
+  return(amenity_matrix)
+}
+
+# Modified analyze_amenity_effects function
+analyze_amenity_effects_dedup <- function(amenities_data, price_data) {
+  # Deduplicate price data
+  price_data_dedup <- deduplicate_properties(price_data)
+  
+  # Calculate amenity frequency and price effects
+  amenity_analysis <- amenities_data %>%
+    # Count unique properties, not total observations
+    group_by(amenity) %>%
+    summarise(
+      unique_properties = n_distinct(property_id),  # Count unique properties
+      .groups = "drop"
+    ) %>%
+    # Join with price data to calculate effects
+    left_join(
+      amenities_data %>%
+        left_join(price_data_dedup, by = "row_id") %>%
+        group_by(amenity) %>%
+        summarise(
+          avg_log_price = mean(log_price, na.rm = TRUE),
+          avg_price = mean(price, na.rm = TRUE),
+          .groups = "drop"
+        ),
+      by = "amenity"
+    ) %>%
+    # Calculate price premium vs baseline
+    mutate(
+      baseline_log_price = mean(price_data_dedup$log_price, na.rm = TRUE),
+      baseline_price = mean(price_data_dedup$price, na.rm = TRUE),
+      log_price_premium = avg_log_price - baseline_log_price,
+      price_premium_pct = (exp(log_price_premium) - 1) * 100,
+      price_difference = avg_price - baseline_price
+    ) %>%
+    # Sort by unique property count (most common amenities first)
+    arrange(desc(unique_properties))
+  
+  return(amenity_analysis)
+}
+
+
+amenities_long_dedup <- process_amenities_dedup(df_ready)
+df_with_amenities_dedup <- create_amenity_matrix_dedup(amenities_long_dedup, df_ready, min_frequency = 100)
+amenity_effects_dedup <- analyze_amenity_effects_dedup(amenities_long_dedup, df_ready)
+
+# Display results
+print("Deduplicated amenities by unique property count:")
+print(amenity_effects_dedup %>% 
+      select(amenity, unique_properties, avg_price, price_premium_pct) %>%
+      head(20))
+
+print("Top price premium amenities (deduplicated):")
+print(amenity_effects_dedup %>%
+      filter(unique_properties >= 100) %>%  # Minimum unique properties
+      arrange(desc(price_premium_pct)) %>%
+      select(amenity, unique_properties, avg_price, price_premium_pct) %>%
+      head(100))
+```
+
+```{r}
+# First, let's create a better version of the deduplication functions that preserves property_id
+
+# Modified process_amenities function that keeps property_id
+process_amenities_dedup_v2 <- function(data) {
+  # First deduplicate by property_id
+  data_dedup <- deduplicate_properties(data)
+  
+  amenities_processed <- data_dedup %>%
+    select(property_id, amenities, price, log_price, listing_type) %>%  # Keep key columns
+    mutate(
+      row_id = row_number(),
+      # Just split by comma without complex cleaning
+      amenities_list = str_split(amenities, ",")
+    ) %>%
+    unnest(amenities_list) %>%
+    mutate(
+      amenity = str_trim(amenities_list),
+      amenity = str_to_lower(amenity),
+      has_amenity = 1
+    ) %>%
+    filter(amenity != "") %>%
+    select(row_id, property_id, amenity, has_amenity, price, log_price, listing_type)
+  
+  return(amenities_processed)
+}
+
+# Modified function to calculate amenity premiums within listing types
+analyze_amenity_effects_by_listing_type <- function(amenities_data, price_data) {
+  # Use the new amenities processing that keeps all necessary columns
+  amenity_with_details <- process_amenities_dedup_v2(price_data)
+  
+  # Calculate baseline prices for each listing type
+  listing_type_baselines <- price_data %>%
+    group_by(property_id) %>%
+    filter(row_number() == 1) %>%  # Deduplicate
+    ungroup() %>%
+    group_by(listing_type) %>%
+    summarise(
+      baseline_log_price = mean(log_price, na.rm = TRUE),
+      baseline_price = mean(price, na.rm = TRUE),
+      total_properties_in_type = n_distinct(property_id),
+      .groups = "drop"
+    )
+  
+  # Calculate amenity effects within each listing type
+  amenity_by_listing <- amenity_with_details %>%
+    group_by(amenity, listing_type) %>%
+    summarise(
+      properties_with_amenity = n_distinct(property_id),
+      avg_log_price_with_amenity = mean(log_price, na.rm = TRUE),
+      avg_price_with_amenity = mean(price, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    # Join with baseline prices
+    left_join(listing_type_baselines, by = "listing_type") %>%
+    # Calculate premiums within each listing type
+    mutate(
+      log_price_premium_within_type = avg_log_price_with_amenity - baseline_log_price,
+      price_premium_pct_within_type = (exp(log_price_premium_within_type) - 1) * 100,
+      price_difference_within_type = avg_price_with_amenity - baseline_price,
+      # Calculate weight (proportion of properties with this amenity in this listing type)
+      weight_within_type = properties_with_amenity / total_properties_in_type
+    )
+  
+  # Calculate weighted average premium across listing types for each amenity
+  weighted_amenity_effects <- amenity_by_listing %>%
+    group_by(amenity) %>%
+    summarise(
+      total_unique_properties = sum(properties_with_amenity),
+      weighted_avg_premium_pct = weighted.mean(price_premium_pct_within_type, 
+                                              properties_with_amenity, 
+                                              na.rm = TRUE),
+      weighted_avg_log_premium = weighted.mean(log_price_premium_within_type, 
+                                              properties_with_amenity, 
+                                              na.rm = TRUE),
+      # Also calculate simple average for comparison
+      simple_avg_premium_pct = mean(price_premium_pct_within_type, na.rm = TRUE),
+      # Standard deviation of premiums across listing types (shows consistency)
+      premium_consistency = sd(price_premium_pct_within_type, na.rm = TRUE),
+      # Number of listing types this amenity appears in
+      listing_types_count = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_unique_properties))
+  
+  # Create detailed breakdown by listing type for top amenities
+  detailed_breakdown <- amenity_by_listing %>%
+    # Filter to amenities that appear in at least 50 properties total
+    filter(amenity %in% (weighted_amenity_effects %>% 
+                        filter(total_unique_properties >= 50) %>% 
+                        pull(amenity))) %>%
+    select(amenity, listing_type, properties_with_amenity, 
+           price_premium_pct_within_type, weight_within_type) %>%
+    arrange(amenity, desc(properties_with_amenity))
+  
+  return(list(
+    weighted_effects = weighted_amenity_effects,
+    detailed_breakdown = detailed_breakdown,
+    listing_type_baselines = listing_type_baselines
+  ))
+}
+
+# Run the analysis
+amenity_results <- analyze_amenity_effects_by_listing_type(amenities_long_dedup, df_ready)
+
+# Display weighted results
+print("Top 20 amenities by weighted price premium:")
+print(amenity_results$weighted_effects %>%
+      filter(total_unique_properties >= 100) %>%
+      arrange(desc(weighted_avg_premium_pct)) %>%
+      select(amenity, total_unique_properties, weighted_avg_premium_pct, 
+             simple_avg_premium_pct, premium_consistency, listing_types_count) %>%
+      head(20))
+
+# Display weighted results
+print("Bottom 20 amenities by weighted price premium:")
+print(amenity_results$weighted_effects %>%
+      filter(total_unique_properties >= 100) %>%
+      arrange((weighted_avg_premium_pct)) %>%
+      select(amenity, total_unique_properties, weighted_avg_premium_pct, 
+             simple_avg_premium_pct, premium_consistency, listing_types_count) %>%
+      head(20))
+
+# Show detailed breakdown for a specific amenity (e.g., "pool")
+print("\nExample: Detailed breakdown for 'pool' amenity across listing types:")
+pool_breakdown <- amenity_results$detailed_breakdown %>%
+  filter(amenity == "pool") %>%
+  arrange(desc(price_premium_pct_within_type))
+print(pool_breakdown)
+
+# Function to examine specific amenity across listing types
+examine_amenity_by_listing_type <- function(amenity_name, results) {
+  cat(paste("\n=== Analysis for:", amenity_name, "===\n"))
+  
+  breakdown <- results$detailed_breakdown %>%
+    filter(amenity == amenity_name) %>%
+    arrange(desc(price_premium_pct_within_type))
+  
+  if(nrow(breakdown) == 0) {
+    cat("Amenity not found in results.\n")
+    return(NULL)
+  }
+  
+  weighted_result <- results$weighted_effects %>%
+    filter(amenity == amenity_name)
+  
+  cat(paste("Total properties with this amenity:", weighted_result$total_unique_properties, "\n"))
+  cat(paste("Weighted average premium:", round(weighted_result$weighted_avg_premium_pct, 2), "%\n"))
+  cat(paste("Simple average premium:", round(weighted_result$simple_avg_premium_pct, 2), "%\n"))
+  cat(paste("Premium consistency (SD):", round(weighted_result$premium_consistency, 2), "%\n"))
+  cat(paste("Appears in", weighted_result$listing_types_count, "listing types\n\n"))
+  
+  print(breakdown)
+  return(breakdown)
+}
+
+
+# Compare weighted vs simple averages for top amenities
+print("\nComparison of weighted vs simple averages (top 15 by total properties):")
+comparison <- amenity_results$weighted_effects %>%
+  head(15) %>%
+  mutate(
+    difference = weighted_avg_premium_pct - simple_avg_premium_pct
+  ) %>%
+  select(amenity, total_unique_properties, weighted_avg_premium_pct, 
+         simple_avg_premium_pct, difference) %>%
+  arrange(desc(abs(difference)))
+
+print(comparison)
+
+comparison <- amenity_results$weighted_effects %>%filter(total_unique_properties>30) %>% 
+  mutate(
+    difference = weighted_avg_premium_pct - simple_avg_premium_pct
+  ) %>%
+  select(amenity, total_unique_properties, weighted_avg_premium_pct, 
+         simple_avg_premium_pct, difference) %>%
+  arrange(desc(abs(weighted_avg_premium_pct))) %>% head(15)
+
+print(comparison)
+```
+
+
+```{r}
+# Count listings per property ID
+property_listing_counts <- df_ready %>%
+  group_by(property_id) %>%
+  summarise(
+    listing_count = n(),
+    .groups = "drop"
+  )
+
+# Summary statistics
+print("Summary of listings per property:")
+print(summary(property_listing_counts$listing_count))
+
+print("\nDistribution of listing counts:")
+print(table(property_listing_counts$listing_count))
+
+print(paste("\nTotal unique properties:", nrow(property_listing_counts)))
+print(paste("Total listings:", sum(property_listing_counts$listing_count)))
+print(paste("Properties with multiple listings:", sum(property_listing_counts$listing_count > 1)))
+print(paste("Percentage with duplicates:", 
+            round(sum(property_listing_counts$listing_count > 1) / nrow(property_listing_counts) * 100, 1), "%"))
+
+# Create histogram
+histogram_listings_plot <- ggplot(property_listing_counts, aes(x = listing_count)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_vline(aes(xintercept = mean(listing_count)), 
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = median(listing_count)), 
+             color = "orange", linetype = "dashed", size = 1) +
+  labs(
+    title = "Distribution of Listings per Property ID",
+    subtitle = paste("Red line = Mean (", round(mean(property_listing_counts$listing_count), 2), 
+                    "), Orange line = Median (", median(property_listing_counts$listing_count), ")"),
+    x = "Number of Listings per Property ID",
+    y = "Number of Properties"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12)
+  )
+```
+```{r}
+save.image("workspace.RData")
+```
+
